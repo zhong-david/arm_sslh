@@ -1,0 +1,4 @@
+This directory contains the source code for the SSLH LLVM pass. To use this pass, copy the file over to llvm/lib/Targets/AARCH64/AARCH64SpectionHardening.cpp
+
+Then, rebuild LLVM and utilize the clang from the build.
+
