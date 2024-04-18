@@ -110,6 +110,10 @@
 #include "llvm/Target/TargetMachine.h"
 #include <cassert>
 
+
+// FIXME: FIXME
+#include <iostream>
+
 using namespace llvm;
 
 #define DEBUG_TYPE "aarch64-speculation-hardening"
@@ -164,6 +168,7 @@ private:
                                     DebugLoc DL) const;
 
   bool slhLoads(MachineBasicBlock &MBB);
+  bool slhConds(MachineBasicBlock &MBB);
   bool makeGPRSpeculationSafe(MachineBasicBlock &MBB,
                               MachineBasicBlock::iterator MBBI,
                               MachineInstr &MI, unsigned Reg);
@@ -299,7 +304,7 @@ bool AArch64SpeculationHardening::instrumentControlFlow(
     if (I == MBB.begin())
       RS.enterBasicBlock(MBB);
     else
-      RS.backward(I);
+      RS.backward(std::prev(I));
     // FIXME: The below just finds *a* unused register. Maybe code could be
     // optimized more if this looks for the register that isn't used for the
     // longest time around this place, to enable more scheduling freedom. Not
@@ -435,33 +440,24 @@ bool AArch64SpeculationHardening::makeGPRSpeculationSafe(
   assert(AArch64::GPR32allRegClass.contains(Reg) ||
          AArch64::GPR64allRegClass.contains(Reg));
 
-
   // Loads cannot directly load a value into the SP (nor WSP).
   // Therefore, if Reg is SP or WSP, it is because the instruction loads from
   // the stack through the stack pointer.
   //
   // Since the stack pointer is never dynamically controllable, don't harden it.
-  // NEW: if reg is SP and offset is fixed -> harden
-  if (Reg == AArch64::SP || Reg == AArch64::WSP) {
-    // Check if there is an immediate offset associated with the stack pointer.
-    bool hasImmediateOffset = false;
-    for (const auto &Operand : MI.operands()) {
-      if (Operand.isImm() && Operand.getOffset() == Operand.getImm()) {
-        // Assuming here that `Operand.getOffset()` method would indicate
-        // the offset value if this operand is associated with an address calculation.
-        // You might need to adapt this depending on how LLVM represents these specifics.
-        // This condition checks if the offset is an immediate and known at compile time.
-        hasImmediateOffset = true;
+  if (Reg == AArch64::SP || Reg == AArch64::WSP)
+    return false;
+
+  // stop loading from stack pointer plz ty
+  if (MI.mayLoad() && MI.getNumOperands() > 1) {
+    const MachineOperand &BaseRegOp = MI.getOperand(1); // Assuming base register is the second operand
+    if (BaseRegOp.isReg()) {
+      unsigned BaseReg = BaseRegOp.getReg();
+      if (BaseReg == AArch64::SP || BaseReg == AArch64::WSP) {
+        return false;
       }
     }
-    // do not harden if unknown (compile-time) offset
-    if (!hasImmediateOffset) {
-        return false;
-    }
   }
-//   }
-//   if (Reg == AArch64::SP || Reg == AArch64::WSP)
-//     return false;
 
   // Do not harden the register again if already hardened before.
   if (RegsAlreadyMasked[Reg])
@@ -469,6 +465,7 @@ bool AArch64SpeculationHardening::makeGPRSpeculationSafe(
 
   const bool Is64Bit = AArch64::GPR64allRegClass.contains(Reg);
   LLVM_DEBUG(dbgs() << "About to harden register : " << Reg << "\n");
+
   BuildMI(MBB, MBBI, MI.getDebugLoc(),
           TII->get(Is64Bit ? AArch64::SpeculationSafeValueX
                            : AArch64::SpeculationSafeValueW))
@@ -494,6 +491,8 @@ bool AArch64SpeculationHardening::slhLoads(MachineBasicBlock &MBB) {
     if (!MI.mayLoad() && !MI.mayStore())
       continue;
 
+    bool isStore = MI.mayStore();
+
     LLVM_DEBUG(dbgs() << "About to harden: " << MI);
 
     // For general purpose register loads, harden the registers loaded into.
@@ -511,8 +510,14 @@ bool AArch64SpeculationHardening::slhLoads(MachineBasicBlock &MBB) {
     // values if all the registers involved in address calculation are already
     // hardened, leading to this load not able to execute on a miss-speculated
     // path.
-    bool HardenLoadedData = AllDefsAreGPR;
-    bool HardenAddressLoadedFrom = !HardenLoadedData || MI.mayStore();
+
+    // for (auto Def : MI.defs()) {
+    //   if (Def.getReg() == AArch64::SP) {
+    //     AllDefsAreGPR = false;
+    //   }
+    // }
+    bool HardenLoadedData = AllDefsAreGPR && !isStore;
+    bool HardenAddressLoadedFrom = !HardenLoadedData;
 
     // First remove registers from AlreadyMaskedRegisters if their value is
     // updated by this instruction - it makes them contain a new value that is
@@ -527,7 +532,7 @@ bool AArch64SpeculationHardening::slhLoads(MachineBasicBlock &MBB) {
     // compile-time constant stack offsets", in
     // https://llvm.org/docs/SpeculativeLoadHardening.html
 
-    if (HardenLoadedData)
+    if (HardenLoadedData) {
       for (auto Def : MI.defs()) {
         if (Def.isDead())
           // Do not mask a register that is not used further.
@@ -539,31 +544,67 @@ bool AArch64SpeculationHardening::slhLoads(MachineBasicBlock &MBB) {
         // an immediate.
         Modified |= makeGPRSpeculationSafe(MBB, NextMBBI, MI, Def.getReg());
       }
-
-    //This has to be called if the instruction is a store
-    if (HardenAddressLoadedFrom)
-      for (auto Use : MI.uses()) {
-        if (!Use.isReg())
-          continue;
-        Register Reg = Use.getReg();
-        // Some loads of floating point data have implicit defs/uses on a
-        // super register of that floating point data. Some examples:
-        // $s0 = LDRSui $sp, 22, implicit-def $q0
-        // $q0 = LD1i64 $q0, 1, renamable $x0
-        // We need to filter out these uses for non-GPR register which occur
-        // because the load partially fills a non-GPR register with the loaded
-        // data. Just skipping all non-GPR registers is safe (for now) as all
-        // AArch64 load instructions only use GPR registers to perform the
-        // address calculation. FIXME: However that might change once we can
-        // produce SVE gather instructions.
-        if (!(AArch64::GPR32allRegClass.contains(Reg) ||
-              AArch64::GPR64allRegClass.contains(Reg)))
-          continue;
-        Modified |= makeGPRSpeculationSafe(MBB, MBBI, MI, Reg);
+    }
+    else if (HardenAddressLoadedFrom) {
+      if (isStore) {
+        if (MI.getNumOperands() > 0) {
+          const MachineOperand &BaseRegOp = MI.getOperand(0);
+          if (BaseRegOp.isReg()) {
+            Modified |= makeGPRSpeculationSafe(MBB, MBBI, MI, BaseRegOp.getReg());
+          }
+        }
       }
+      else {
+        for (auto Use : MI.uses()) {
+          if (!Use.isReg())
+            continue;
+          Register Reg = Use.getReg();
+          // Some loads of floating point data have implicit defs/uses on a
+          // super register of that floating point data. Some examples:
+          // $s0 = LDRSui $sp, 22, implicit-def $q0
+          // $q0 = LD1i64 $q0, 1, renamable $x0
+          // We need to filter out these uses for non-GPR register which occur
+          // because the load partially fills a non-GPR register with the loaded
+          // data. Just skipping all non-GPR registers is safe (for now) as all
+          // AArch64 load instructions only use GPR registers to perform the
+          // address calculation. FIXME: However that might change once we can
+          // produce SVE gather instructions.
+          if (!(AArch64::GPR32allRegClass.contains(Reg) ||
+                AArch64::GPR64allRegClass.contains(Reg)))
+            continue;
+          Modified |= makeGPRSpeculationSafe(MBB, MBBI, MI, Reg);
+        }
+      }
+    }
   }
   return Modified;
 }
+
+bool AArch64SpeculationHardening::slhConds(MachineBasicBlock &MBB) {
+  bool Modified = false;
+
+  LLVM_DEBUG(dbgs() << "slhCondsCondsConds running on MBB: " << MBB);
+
+  RegsAlreadyMasked.reset();
+
+  MachineBasicBlock::iterator MBBI = MBB.begin(), E = MBB.end();
+  MachineBasicBlock::iterator NextMBBI;
+  for (; MBBI != E; MBBI = NextMBBI) {
+    MachineInstr &MI = *MBBI;
+    NextMBBI = std::next(MBBI);
+    
+    unsigned int opcode = MI.getOpcode();
+    // FIXME: better cmpInst opcode detection
+    if (opcode == 1507 || (opcode >= 6633 && opcode <= 6639) /*subs*/ || (opcode >= 1413 && opcode <= 1421) /*adds*/ || (opcode >= 1785 && opcode <= 1788) /*cmp*/) {
+      // go thru operands
+      for (auto Def : MI.defs()) {
+        Modified |= makeGPRSpeculationSafe(MBB, MBBI, MI, Def.getReg());
+      }
+    }
+  }
+  return Modified;
+}
+
 
 /// \brief If MBBI references a pseudo instruction that should be expanded
 /// here, do the expansion and return true. Otherwise return false.
@@ -693,6 +734,11 @@ bool AArch64SpeculationHardening::runOnMachineFunction(MachineFunction &MF) {
                   "SpeculationSafeValue intrinsics *****\n");
     for (auto &MBB : MF)
       Modified |= slhLoads(MBB);
+  }
+
+  // 1.5 check Conds for cond
+  for (auto &MBB : MF) {
+    Modified |= slhConds(MBB);
   }
 
   // 2. Add instrumentation code to function entry and exits.
