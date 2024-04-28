@@ -1,4 +1,4 @@
-#  ASSLH
+#  ARM SSLH
 
 AARCH64 Strong Speculative Load Hardening: Mitigating Spectre Attacks with LLVM
 
